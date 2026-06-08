@@ -4,12 +4,15 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+import pytz
 
 from dotenv import load_dotenv
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+
+from tooltips import TOOLTIPS
 
 # ============================================================
 # ENV
@@ -30,10 +33,10 @@ client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 # UI
 # ============================================================
 
-st.set_page_config(page_title="Swing Execution Engine v8", layout="wide")
+st.set_page_config(page_title="PRO QUANT v9", layout="wide")
 
-st.title("📊 Swing Execution Engine v8")
-st.caption("Clean breakout + execution system (NO RSI)")
+st.title("📊 PRO QUANT EXECUTION ENGINE v9")
+st.caption("Clean swing system: 1H + SPY regime + breakout engine")
 
 # ============================================================
 # DEFAULTS
@@ -45,10 +48,12 @@ DEFAULTS = {
     "breakout_len": 20,
     "atr_len": 14,
     "atr_mult": 1.5,
+    "trail_mult": 1.2,
+    "use_market_filter": False,
 }
 
 # ============================================================
-# RESET BUTTON (FIXED)
+# RESET BUTTON (RESTORED)
 # ============================================================
 
 if st.sidebar.button("🔄 Reset to Defaults"):
@@ -57,40 +62,25 @@ if st.sidebar.button("🔄 Reset to Defaults"):
     st.rerun()
 
 # ============================================================
-# SIDEBAR INPUTS (STATE SAFE)
+# SIDEBAR
 # ============================================================
 
 st.sidebar.header("⚙️ Settings")
 
-EMA_FAST = st.sidebar.slider(
-    "EMA Fast", 5, 50,
-    st.session_state.get("ema_fast", DEFAULTS["ema_fast"]),
-    key="ema_fast"
-)
+EMA_FAST = st.sidebar.slider("EMA Fast", 5, 50, st.session_state.get("ema_fast", DEFAULTS["ema_fast"]), key="ema_fast", help=TOOLTIPS.get("ema_fast"))
+EMA_SLOW = st.sidebar.slider("EMA Slow", 20, 200, st.session_state.get("ema_slow", DEFAULTS["ema_slow"]), key="ema_slow", help=TOOLTIPS.get("ema_slow"))
 
-EMA_SLOW = st.sidebar.slider(
-    "EMA Slow", 20, 200,
-    st.session_state.get("ema_slow", DEFAULTS["ema_slow"]),
-    key="ema_slow"
-)
+BREAKOUT_LEN = st.sidebar.slider("Breakout Length", 10, 80, st.session_state.get("breakout_len", DEFAULTS["breakout_len"]), key="breakout_len", help=TOOLTIPS.get("breakout_len"))
+ATR_LEN = st.sidebar.slider("ATR Length", 5, 30, st.session_state.get("atr_len", DEFAULTS["atr_len"]), key="atr_len", help=TOOLTIPS.get("atr_len"))
 
-BREAKOUT_LEN = st.sidebar.slider(
-    "Breakout Length", 5, 50,
-    st.session_state.get("breakout_len", DEFAULTS["breakout_len"]),
-    key="breakout_len"
-)
+ATR_MULT = st.sidebar.slider("ATR Multiplier", 1.0, 3.0, st.session_state.get("atr_mult", DEFAULTS["atr_mult"]), 0.1, key="atr_mult", help=TOOLTIPS.get("atr_mult"))
 
-ATR_LEN = st.sidebar.slider(
-    "ATR Length", 5, 30,
-    st.session_state.get("atr_len", DEFAULTS["atr_len"]),
-    key="atr_len"
-)
+TRAIL_MULT = st.sidebar.slider("Trailing Stop Multiplier", 0.8, 3.0, st.session_state.get("trail_mult", DEFAULTS["trail_mult"]), 0.1, key="trail_mult", help=TOOLTIPS.get("trail_mult"))
 
-ATR_MULT = st.sidebar.slider(
-    "ATR Multiplier", 1.0, 3.0,
-    float(st.session_state.get("atr_mult", DEFAULTS["atr_mult"])),
-    0.1,
-    key="atr_mult"
+USE_MARKET_FILTER = st.sidebar.checkbox(
+    "📊 Market Regime Filter (SPY)",
+    value=st.session_state.get("use_market_filter", False),
+    key="use_market_filter", help=TOOLTIPS.get("market_filter")
 )
 
 # ============================================================
@@ -136,32 +126,40 @@ def atr(df, length=14):
         (low - close.shift()).abs()
     ], axis=1).max(axis=1)
 
-    atr_series = tr.ewm(alpha=1/length, adjust=False).mean()
+    return tr.ewm(alpha=1/length, adjust=False).mean().ffill().bfill()
 
-    # safety fix (never None)
-    atr_series = atr_series.ffill().bfill()
+# ============================================================
+# CLEAN BREAKOUT (FIXED)
+# ============================================================
 
-    return atr_series
+def breakout(df):
+    close = df["close"]
+    level = close.rolling(BREAKOUT_LEN).max().iloc[-2]
+    return close.iloc[-1] > level
+
+# ============================================================
+# VOLUME FILTER (CLEAN)
+# ============================================================
 
 def volume_ok(df):
-    return df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1]
+    vol = df["volume"]
+    avg = vol.rolling(20).mean()
+    return not avg.isna().iloc[-1] and vol.iloc[-1] > avg.iloc[-1]
 
 # ============================================================
-# STATE
+# MARKET REGIME (GLOBAL ONLY)
 # ============================================================
 
-def state(score):
-    if score >= 4:
-        return "🚀 BREAKOUT READY"
-    elif score == 3:
-        return "⚡ WATCH"
-    elif score == 2:
-        return "🔥 BUILDING"
-    else:
-        return "❌ NO TRADE"
+def compute_spy_regime():
+    spy = get_data("SPY")
+    close = spy["close"]
+    ema50 = ema(close, 50)
+    return close.iloc[-1] > ema50.iloc[-1]
+
+SPY_REGIME = compute_spy_regime()
 
 # ============================================================
-# ANALYSIS ENGINE (NO RSI)
+# ANALYSIS ENGINE
 # ============================================================
 
 def analyze(df):
@@ -171,132 +169,129 @@ def analyze(df):
     ema_fast = ema(close, EMA_FAST)
     ema_slow = ema(close, EMA_SLOW)
 
-    # -------------------------
     # TREND
-    # -------------------------
     trend = price > ema_fast.iloc[-1] > ema_slow.iloc[-1]
 
-    # -------------------------
-    # MOMENTUM (price acceleration)
-    # -------------------------
-    momentum = ema_fast.iloc[-1] > ema_fast.iloc[-3] and price > ema_fast.iloc[-1]
+    # MOMENTUM (slope proxy)
+    momentum = ema_fast.iloc[-1] > ema_fast.iloc[-3]
 
-    # -------------------------
     # BREAKOUT
-    # -------------------------
-    breakout = price > close.rolling(BREAKOUT_LEN).max().iloc[-2]
+    brk = breakout(df)
 
-    # -------------------------
     # COMPRESSION
-    # -------------------------
     compression = abs(price - ema_fast.iloc[-1]) / price < 0.015
 
-    # -------------------------
     # VOLUME
-    # -------------------------
     vol = volume_ok(df)
 
-    # -------------------------
-    # SCORE
-    # -------------------------
-    score = int(trend) + int(momentum) + int(breakout) + int(compression) + int(vol)
+    # REGIME FILTER
+    regime_ok = SPY_REGIME if USE_MARKET_FILTER else True
 
-    # -------------------------
-    # ATR EXECUTION
-    # -------------------------
+    # SCORE (CLEAN + BALANCED)
+    score = (
+        int(trend)
+        + int(momentum)
+        + int(brk)
+        + int(compression)
+        + int(vol)
+        + int(regime_ok)
+    )
+
+    # ATR STOP SYSTEM
     atr_val = float(atr(df, ATR_LEN).iloc[-1])
 
     entry = price
     stop = price - ATR_MULT * atr_val
-    risk = price - stop
-    target = price + (2 * risk) if risk > 0 else price
+    trail = price - TRAIL_MULT * atr_val
+    stop = min(stop, trail)
 
+    risk = price - stop
+    target = price + 2 * risk if risk > 0 else price
     rr = (target - price) / risk if risk > 0 else 0
 
-    # -------------------------
     # QUALITY
-    # -------------------------
-    if score == 5:
+    if score >= 6:
         quality = "🟢 A+ SETUP"
-    elif score == 4:
+    elif score == 5:
         quality = "🟡 B SETUP"
-    elif score == 3:
+    elif score == 4:
         quality = "🟠 C SETUP"
     else:
         quality = "🔴 NO TRADE"
 
     return {
+        "Symbol": df.attrs["symbol"],
         "Price": round(price, 2),
         "Score": score,
-        "State": state(score),
+        "Quality": quality,
 
         "Trend": "✅" if trend else "❌",
         "Compression": "✅" if compression else "❌",
         "Volume": "✅" if vol else "❌",
-        "Momentum": "📈" if momentum else "📉",
-        "Breakout": "✅" if breakout else "❌",
+        "Momentum": "📈" if momentum else "❌",
+        "Breakout": "✅" if brk else "❌",
 
         "Entry": round(entry, 2),
         "Stop": round(stop, 2),
         "Target": round(target, 2),
         "R/R": round(rr, 2),
-
-        "Quality": quality
     }
 
 # ============================================================
-# MARKET FILTER
+# TIME (CST)
 # ============================================================
 
-def market_status():
-    try:
-        spy = get_data("SPY")
-        close = spy["close"]
-        ema50 = ema(close, 50)
+cst = pytz.timezone("America/Chicago")
+now = datetime.now(cst)
 
-        bullish = close.iloc[-1] > ema50.iloc[-1]
-        return ("🟢 BULLISH" if bullish else "🔴 BEARISH", bullish)
-    except:
-        return ("⚪ UNKNOWN", False)
+market_open = now.replace(hour=8, minute=30)
+market_close = now.replace(hour=15, minute=0)
+
+if market_open <= now <= market_close:
+    st.markdown("<meta http-equiv='refresh' content='60'>", unsafe_allow_html=True)
 
 # ============================================================
-# RUN SCAN
+# BANNER
 # ============================================================
 
-market_text, _ = market_status()
+regime_text = "🟢 BULLISH" if SPY_REGIME else "🔴 BEARISH"
+bg_color = "#1f7a1f" if SPY_REGIME else "#8b1a1a"
 
-c1, c2 = st.columns([4, 1])
+st.markdown(f"""
+<div style="background-color:{bg_color};padding:12px;border-radius:10px;
+color:white;font-size:18px;font-weight:600;text-align:center;">
+Market Regime: {regime_text}
+</div>
+""", unsafe_allow_html=True)
 
-with c1:
-    st.success(f"Market: {market_text}")
+st.caption(f"Last Refresh (CST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-with c2:
-    st.caption(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+# ============================================================
+# SCAN
+# ============================================================
 
 results = []
 
 for s in SYMBOLS:
     try:
         df = get_data(s)
-        row = analyze(df)
-        row["Symbol"] = s
-        results.append(row)
+        df.attrs["symbol"] = s
+        results.append(analyze(df))
     except:
         results.append({
             "Symbol": s,
             "Price": 0,
             "Score": 0,
-            "State": "ERROR",
-            "Momentum": "❌",
+            "Quality": "ERROR",
             "Trend": "❌",
-            "Breakout": "❌",
             "Compression": "❌",
             "Volume": "❌",
+            "Momentum": "❌",
+            "Breakout": "❌",
             "Entry": 0,
             "Stop": 0,
             "Target": 0,
             "R/R": 0,
-            "Quality": "❌"
         })
 
 df = pd.DataFrame(results).sort_values("Score", ascending=False)
@@ -324,52 +319,4 @@ st.markdown(f"### {top['Quality']}")
 
 st.subheader("📊 Execution Dashboard")
 
-st.dataframe(
-    df[[
-        "Symbol",
-        "Price",
-        "Score",
-        "Quality",
-        "Trend",
-        "Compression",
-        "Volume",
-        "Momentum",
-        "Breakout",
-        "Entry",
-        "Stop",
-        "Target",
-        "R/R"
-    ]].style.format({
-        "Price": "{:.2f}",
-        "Entry": "{:.2f}",
-        "Stop": "{:.2f}",
-        "Target": "{:.2f}",
-        "R/R": "{:.2f}",
-    }),
-    use_container_width=True
-)
-
-# ============================================================
-# GUIDE
-# ============================================================
-
-with st.expander("How to Use"):
-    st.markdown("""
-### Setup Types
-- 🟢 A+ = Best breakout setup
-- 🟡 B = Good setup
-- 🟠 C = Weak setup
-- 🔴 Ignore
-
-### Execution
-- Entry = current price
-- Stop = ATR-based risk
-- Target = 2R reward
-
-### Logic
-- Trend alignment
-- Momentum acceleration
-- Breakout confirmation
-- Compression before move
-- Volume confirmation
-""")
+st.dataframe(df, use_container_width=True)
