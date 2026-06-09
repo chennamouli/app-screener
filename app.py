@@ -55,7 +55,8 @@ DEFAULTS = {
 # ============================================================
 # RESET BUTTON (RESTORED)
 # ============================================================
-
+st.sidebar.header("Controls")
+    
 if st.sidebar.button("🔄 Reset to Defaults"):
     for k, v in DEFAULTS.items():
         st.session_state[k] = v
@@ -247,8 +248,8 @@ now = datetime.now(cst)
 market_open = now.replace(hour=8, minute=30)
 market_close = now.replace(hour=15, minute=0)
 
-if market_open <= now <= market_close:
-    st.markdown("<meta http-equiv='refresh' content='60'>", unsafe_allow_html=True)
+# if market_open <= now <= market_close:
+    # st.markdown("<meta http-equiv='refresh' content='60'>", unsafe_allow_html=True)
 
 # ============================================================
 # BANNER
@@ -320,3 +321,12 @@ st.markdown(f"### {top['Quality']}")
 st.subheader("📊 Execution Dashboard")
 
 st.dataframe(df, use_container_width=True)
+
+
+# ============================================================
+# DOCUMENTATION
+# ============================================================
+
+with st.sidebar.expander("📖 Help"):
+    with open("README.md", "r", encoding="utf-8") as f:
+        st.markdown(f.read())
